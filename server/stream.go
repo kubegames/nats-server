@@ -3308,12 +3308,6 @@ func (mset *stream) stop(deleteFlag, advisory bool) error {
 		mset.infoSub = nil
 	}
 
-	// Quit channel.
-	if mset.qch != nil {
-		close(mset.qch)
-		mset.qch = nil
-	}
-
 	// Cluster cleanup
 	if n := mset.node; n != nil {
 		if deleteFlag {
@@ -3326,6 +3320,12 @@ func (mset *stream) stop(deleteFlag, advisory bool) error {
 	// Send stream delete advisory after the consumers.
 	if deleteFlag && advisory {
 		mset.sendDeleteAdvisoryLocked()
+	}
+
+	// Quit channel, do this after sending the delete advisory
+	if mset.qch != nil {
+		close(mset.qch)
+		mset.qch = nil
 	}
 
 	c := mset.client

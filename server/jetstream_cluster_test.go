@@ -10736,6 +10736,143 @@ func TestJetStreamClusterInterestRetentionWithFilteredConsumersExtra(t *testing.
 	checkState(0)
 }
 
+func TestJetStreamStreamAdvisories(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+
+	c := createJetStreamClusterExplicit(t, "JSC", 3)
+	defer c.shutdown()
+
+	checkAdv := func(t *testing.T, sub *nats.Subscription, expectedPrefix string) {
+		t.Helper()
+		msg := natsNexMsg(t, sub, time.Second)
+		if !strings.HasPrefix(msg.Subject, expectedPrefix) {
+			t.Fatalf("Expected advisory with prefix %q, got: %q", expectedPrefix, msg.Subject)
+		}
+	}
+
+	checkAdvisories := func(t *testing.T, s *Server) {
+
+		nc, js := jsClientConnect(t, s)
+		defer nc.Close()
+
+		streamName := "TEST_ADVISORIES"
+		sub := natsSubSync(t, nc, "$JS.EVENT.ADVISORY.STREAM.*."+streamName)
+
+		si, err := js.AddStream(&nats.StreamConfig{Name: streamName, Subjects: []string{"foo"}, Storage: nats.FileStorage})
+		require_NoError(t, err)
+		checkAdv(t, sub, JSAdvisoryStreamCreatedPre)
+
+		si.Config.MaxMsgs = 1000
+		_, err = js.UpdateStream(&si.Config)
+		require_NoError(t, err)
+		checkAdv(t, sub, JSAdvisoryStreamUpdatedPre)
+
+		snapreq := &JSApiStreamSnapshotRequest{
+			DeliverSubject: nats.NewInbox(),
+			ChunkSize:      512,
+		}
+		var snapshot []byte
+		done := make(chan bool)
+		nc.Subscribe(snapreq.DeliverSubject, func(m *nats.Msg) {
+			// EOF
+			if len(m.Data) == 0 {
+				done <- true
+				return
+			}
+			// Could be writing to a file here too.
+			snapshot = append(snapshot, m.Data...)
+			// Flow ack
+			m.Respond(nil)
+		})
+
+		req, _ := json.Marshal(snapreq)
+		rmsg, err := nc.Request(fmt.Sprintf(JSApiStreamSnapshotT, streamName), req, time.Second)
+		if err != nil {
+			t.Fatalf("Unexpected error on snapshot request: %v", err)
+		}
+
+		var snapresp JSApiStreamSnapshotResponse
+		json.Unmarshal(rmsg.Data, &snapresp)
+		if snapresp.Error != nil {
+			t.Fatalf("Did not get correct error response: %+v", snapresp.Error)
+		}
+
+		// Wait to receive the snapshot.
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("Did not receive our snapshot in time")
+		}
+
+		checkAdv(t, sub, JSAdvisoryStreamSnapshotCreatePre)
+		checkAdv(t, sub, JSAdvisoryStreamSnapshotCompletePre)
+
+		err = js.DeleteStream(streamName)
+		require_NoError(t, err)
+		checkAdv(t, sub, JSAdvisoryStreamDeletedPre)
+
+		state := *snapresp.State
+		config := *snapresp.Config
+		resreq := &JSApiStreamRestoreRequest{
+			Config: config,
+			State:  state,
+		}
+		req, _ = json.Marshal(resreq)
+		rmsg, err = nc.Request(fmt.Sprintf(JSApiStreamRestoreT, streamName), req, 5*time.Second)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		var resresp JSApiStreamRestoreResponse
+		json.Unmarshal(rmsg.Data, &resresp)
+		if resresp.Error != nil {
+			t.Fatalf("Got an unexpected error response: %+v", resresp.Error)
+		}
+
+		// Send our snapshot back in to restore the stream.
+		// Can be any size message.
+		var chunk [1024]byte
+		for r := bytes.NewReader(snapshot); ; {
+			n, err := r.Read(chunk[:])
+			if err != nil {
+				break
+			}
+			nc.Request(resresp.DeliverSubject, chunk[:n], time.Second)
+		}
+		rmsg, err = nc.Request(resresp.DeliverSubject, nil, time.Second)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		resresp.Error = nil
+		json.Unmarshal(rmsg.Data, &resresp)
+		if resresp.Error != nil {
+			t.Fatalf("Got an unexpected error response: %+v", resresp.Error)
+		}
+
+		checkAdv(t, sub, JSAdvisoryStreamRestoreCreatePre)
+		// At this point, the stream_created advisory may be sent before
+		// or after the restore_complete advisory because they are sent
+		// using different "send queues". That is, the restore uses the
+		// server's event queue while the stream_created is sent from
+		// the stream's own send queue.
+		rmsg = natsNexMsg(t, sub, time.Second)
+		if strings.HasPrefix(rmsg.Subject, JSAdvisoryStreamRestoreCompletePre) {
+			checkAdv(t, sub, JSAdvisoryStreamCreatedPre)
+		} else if strings.HasPrefix(rmsg.Subject, JSAdvisoryStreamCreatedPre) {
+			checkAdv(t, sub, JSAdvisoryStreamRestoreCompletePre)
+		} else {
+			t.Fatalf("Unexpected subject: %s", rmsg.Subject)
+		}
+	}
+
+	t.Run("Single", func(t *testing.T) { checkAdvisories(t, s) })
+	t.Run("Clustered", func(t *testing.T) { checkAdvisories(t, c.randomServer()) })
+}
+
 // Support functions
 
 // Used to setup superclusters for tests.
